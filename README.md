@@ -24,16 +24,17 @@ directorio de datos en cada arranque.
 5. [Variables de `.env`](#variables-de-env)
 6. [Certificado TLS](#certificado-tls)
 7. [Configurar los clientes Docker](#configurar-los-clientes-docker)
-8. [Uso básico](#uso-básico)
-9. [Repositorio Debian (aptly)](#repositorio-debian-aptly)
-10. [Operación del stack](#operación-del-stack)
-11. [Copias de seguridad y restauración](#copias-de-seguridad-y-restauración)
-12. [Actualizar Harbor](#actualizar-harbor)
-13. [Cambios de configuración habituales](#cambios-de-configuración-habituales)
-14. [Solución de problemas](#solución-de-problemas)
-15. [Seguridad](#seguridad)
-16. [Diferencias con el instalador oficial](#diferencias-con-el-instalador-oficial)
-17. [Licencia](#licencia)
+8. [Acceso desde otras máquinas (túnel SSH)](#acceso-desde-otras-máquinas-túnel-ssh)
+9. [Uso básico](#uso-básico)
+10. [Repositorio Debian (aptly)](#repositorio-debian-aptly)
+11. [Operación del stack](#operación-del-stack)
+12. [Copias de seguridad y restauración](#copias-de-seguridad-y-restauración)
+13. [Actualizar Harbor](#actualizar-harbor)
+14. [Cambios de configuración habituales](#cambios-de-configuración-habituales)
+15. [Solución de problemas](#solución-de-problemas)
+16. [Seguridad](#seguridad)
+17. [Diferencias con el instalador oficial](#diferencias-con-el-instalador-oficial)
+18. [Licencia](#licencia)
 
 ---
 
@@ -58,9 +59,11 @@ directorio de datos en cada arranque.
 # 1. Generar .env con contraseñas y secretos aleatorios (muestra la contraseña de admin)
 ./generate-env.sh
 
-# 2. Ajustar el nombre del servidor
+# 2. (Opcional) Por defecto solo escucha en 127.0.0.1 y se accede por túnel SSH con
+#    la URL https://localhost (ver "Acceso desde otras máquinas"). Para abrirlo a la red:
 #    HARBOR_HOSTNAME=harbor.midominio.local
 #    HARBOR_EXTERNAL_URL=https://harbor.midominio.local
+#    HARBOR_HTTP_PORT=80   HARBOR_HTTPS_PORT=443
 vi .env
 
 # 3. Arrancar y esperar a que todos los servicios estén healthy (~20 s)
@@ -176,7 +179,7 @@ HARBOR_URL=https://localhost./examples/push-image.sh  ./examples/push-image.sh
 | `HARBOR_VERSION` | Tag de las imágenes `goharbor/*` (`v2.15.2`) |
 | `HARBOR_HOSTNAME` | Nombre DNS o IP del servidor. Se usa para el certificado autofirmado |
 | `HARBOR_EXTERNAL_URL` | URL pública (`https://host[:puerto]`). La usa core para tokens y enlaces |
-| `HARBOR_HTTP_PORT` / `HARBOR_HTTPS_PORT` | Puertos publicados. Admite `IP:puerto` (p. ej. `127.0.0.1:8443`) |
+| `HARBOR_HTTP_PORT` / `HARBOR_HTTPS_PORT` | Puertos publicados. Por defecto `127.0.0.1:80` / `127.0.0.1:443` (solo localhost). Sin IP escuchan en todas las interfaces |
 | `HARBOR_DATA_DIR` | Directorio de datos persistentes (por defecto `./data`) |
 | `LOG_LEVEL` | `debug`, `info`, `warning`, `error` |
 | `HARBOR_ADMIN_PASSWORD` | Contraseña inicial de `admin` (**solo se aplica en el primer arranque**) |
@@ -210,6 +213,11 @@ y luego `docker compose restart proxy`.
 
 ## Configurar los clientes Docker
 
+Con la configuración por defecto (`https://localhost`, en el servidor o a través del túnel
+SSH) no hace falta nada: Docker acepta sin verificar el certificado los registries que
+resuelven a una dirección de loopback. Lo que sigue aplica cuando Harbor se publica con
+un nombre de red.
+
 Si usas el certificado autofirmado o de una CA interna, **cada host que haga
 `docker pull/push`** debe confiar en él (no hace falta reiniciar Docker):
 
@@ -225,6 +233,46 @@ Otros clientes:
   (`/usr/local/share/ca-certificates/` + `update-ca-certificates`) o configura
   `hosts.toml` de containerd.
 - **Podman / Buildah / Skopeo**: `/etc/containers/certs.d/<HARBOR_HOSTNAME>/ca.crt`.
+
+## Acceso desde otras máquinas (túnel SSH)
+
+Por defecto el proxy solo escucha en `127.0.0.1:80` y `127.0.0.1:443`: ningún otro equipo
+llega a Harbor directamente. Cada cliente abre un túnel SSH al servidor y usa la **misma
+URL que el servidor, `https://localhost`**. Tiene que ser exactamente esa: es la que Harbor
+devuelve a `docker` para pedir el token, y con otra el `docker login` falla.
+
+```bash
+# En cada cliente (sudo: los puertos locales < 1024 requieren root)
+sudo ssh -N -o ExitOnForwardFailure=yes \
+  -L 443:127.0.0.1:443 -L 80:127.0.0.1:80 usuario@servidor
+```
+
+Con el túnel abierto, en el cliente:
+
+| Uso | Cómo |
+|---|---|
+| UI web | `https://localhost` (el navegador avisa del certificado autofirmado) |
+| Docker | `docker login localhost` · `docker push localhost/<proyecto>/<imagen>:<tag>` |
+| apt | `deb [signed-by=/etc/apt/keyrings/aptly-repo.asc] http://localhost/debian trixie main` |
+| Scripts de ejemplo | `HARBOR_URL=https://localhost` / `APTLY_URL=https://localhost/aptly/api` |
+
+Notas:
+- Los puertos 80 y 443 del cliente tienen que estar libres. Para no usar `sudo`, se puede
+  permitir abrir puertos bajos sin root: `sudo sysctl net.ipv4.ip_unprivileged_port_start=80`.
+- Para un túnel permanente, usa `autossh` o una entrada en `~/.ssh/config` con
+  `LocalForward 443 127.0.0.1:443`, `LocalForward 80 127.0.0.1:80` y `ExitOnForwardFailure yes`.
+- Para dar acceso a alguien solo al túnel, sin shell en el servidor, restringe su clave en
+  `~/.ssh/authorized_keys`:
+  `restrict,port-forwarding,permitopen="127.0.0.1:443",permitopen="127.0.0.1:80" ssh-ed25519 AAAA...`
+  y conecta con `ssh -N`.
+
+Comprobar en el servidor que solo escucha en localhost:
+
+```bash
+ss -ltn | grep -E ':(80|443) '     # debe mostrar 127.0.0.1:80 y 127.0.0.1:443 (no 0.0.0.0)
+docker port nginx                  # 8080/tcp -> 127.0.0.1:80   8443/tcp -> 127.0.0.1:443
+curl -sk --max-time 3 https://<IP de la LAN>/ || echo "OK: no accesible por la red"
+```
 
 ## Uso básico
 
@@ -544,6 +592,12 @@ motor: `docker context show`.
   vulnerabilidades graves (configuración del proyecto).
 - La clave privada GPG de aptly (`data/aptly/gpg/`) no tiene passphrase: quien la
   obtenga puede firmar paquetes que los clientes aceptarán. Protégela como un secreto.
+- Por defecto los puertos solo escuchan en `127.0.0.1` (acceso por túnel SSH). Con Docker
+  Engine < 28, comprueba con el stack en marcha que `route_localnet` sigue a 0
+  (`grep -l 1 /proc/sys/net/ipv4/conf/*/route_localnet` no debe devolver nada). Si alguna
+  interfaz lo tiene a 1, un equipo de la misma red podría llegar a esos puertos enviando
+  paquetes a 127.0.0.1; actualiza Docker o bloquéalo con
+  `sudo iptables -t raw -I PREROUTING ! -i lo -d 127.0.0.0/8 -j DROP`.
 - Todos los contenedores usan `cap_drop: ALL` y solo añaden las capacidades mínimas
   del compose oficial.
 

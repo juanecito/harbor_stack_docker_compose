@@ -59,6 +59,7 @@ Para tareas de gestión de imágenes, contenedores o del propio Harbor, usa la s
 | API de aptly tras nginx con `auth_basic` (htpasswd bcrypt del `init`) | aptly no tiene autenticación propia |
 | `/debian/` servido por nginx desde `data/aptly/public` y también por HTTP | apt verifica las firmas GPG; evita repartir el certificado autofirmado |
 | Clave GPG generada por el entrypoint de aptly, sin passphrase | Firma desatendida por API (`"Signing":{"Batch":true}`) |
+| Puertos en `127.0.0.1:80/443` y URL `https://localhost` por defecto | Acceso solo por túnel SSH (`-L 443:127.0.0.1:443 -L 80:127.0.0.1:80`); la URL debe ser igual en servidor y clientes porque Harbor la usa como realm del token |
 | `container_name` iguales al oficial (`harbor-core`, `harbor-db`, `redis`, `nginx`...; excepción: el registry se llama `registry_harbor`) | Compatibilidad con documentación y scripts de Harbor; `registry_harbor` por petición del equipo (2026-10-06) |
 
 ## Datos técnicos clave
