@@ -1,0 +1,308 @@
+# Copyright Project Harbor Authors
+# Modifications Copyright (c) 2026 Juan Maria Gomez Lopez <juan-maria.gomez-lopez@tutamail.com>
+# SPDX-License-Identifier: Apache-2.0
+# Derivado de las plantillas de goharbor/prepare:v2.15.2 (ver NOTICE).
+
+# Harbor v2.15.2 - despliegue autocontenido con Docker Compose
+#
+# Basado en las plantillas oficiales del instalador (goharbor/prepare:v2.15.2),
+# pero sin necesidad de ejecutar install.sh / prepare.
+#
+# Uso:
+#   ./generate-env.sh          # crea .env con secretos aleatorios (solo la primera vez)
+#   docker compose up -d
+#
+# Componentes: init (one-shot), postgresql, redis (valkey), registry, registryctl,
+# core, portal, jobservice, trivy-adapter, aptly (repositorio Debian) y proxy (nginx, TLS).
+
+name: harbor
+
+x-harbor-common: &harbor-common
+  restart: always
+  networks:
+    - harbor
+  # Mantiene el test de healthcheck de cada imagen; solo acelera la detección
+  # durante el arranque (start_interval requiere Docker Engine >= 25)
+  healthcheck:
+    interval: 30s
+    start_period: 120s
+    start_interval: 3s
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+
+x-core-urls: &core-urls
+  CORE_URL: http://core:8080
+  REGISTRY_URL: http://registry:5000
+  REGISTRY_CONTROLLER_URL: http://registryctl:8080
+
+services:
+  # ---------------------------------------------------------------------------
+  # Prepara el directorio de datos: permisos, par de claves del token service,
+  # secretkey, htpasswd del registry y certificado TLS autofirmado (si no hay uno).
+  # ---------------------------------------------------------------------------
+  init:
+    image: goharbor/prepare:${HARBOR_VERSION}
+    entrypoint: ["/bin/sh", "/init.sh"]
+    environment:
+      HARBOR_HOSTNAME: ${HARBOR_HOSTNAME}
+      REGISTRY_PASSWORD: ${REGISTRY_PASSWORD:?ejecuta ./generate-env.sh}
+      APTLY_API_USER: ${APTLY_API_USER:-aptly}
+      APTLY_API_PASSWORD: ${APTLY_API_PASSWORD:?añade APTLY_API_PASSWORD a .env}
+    volumes:
+      - ${HARBOR_DATA_DIR}:/data:z
+      - ./scripts/init.sh:/init.sh:ro
+    network_mode: none
+    restart: "no"
+
+  postgresql:
+    <<: *harbor-common
+    image: goharbor/harbor-db:${HARBOR_VERSION}
+    container_name: harbor-db
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, SETGID, SETUID]
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?ejecuta ./generate-env.sh}
+    volumes:
+      - ${HARBOR_DATA_DIR}/database:/var/lib/postgresql/data:z
+    shm_size: 1gb
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  redis:
+    <<: *harbor-common
+    image: goharbor/valkey-photon:${HARBOR_VERSION}
+    container_name: redis
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID]
+    volumes:
+      - ${HARBOR_DATA_DIR}/redis:/var/lib/redis
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  registry:
+    <<: *harbor-common
+    image: goharbor/registry-photon:${HARBOR_VERSION}
+    container_name: registry_harbor
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID]
+    volumes:
+      - ${HARBOR_DATA_DIR}/registry:/storage:z
+      - ./config/registry/config.yml:/etc/registry/config.yml:ro
+      - ${HARBOR_DATA_DIR}/secret/registry/passwd:/etc/registry/passwd:ro
+      - ${HARBOR_DATA_DIR}/secret/registry/root.crt:/etc/registry/root.crt:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  registryctl:
+    <<: *harbor-common
+    image: goharbor/harbor-registryctl:${HARBOR_VERSION}
+    container_name: registryctl
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID]
+    environment:
+      CORE_SECRET: ${CORE_SECRET}
+      JOBSERVICE_SECRET: ${JOBSERVICE_SECRET}
+    volumes:
+      - ${HARBOR_DATA_DIR}/registry:/storage:z
+      - ./config/registry/config.yml:/etc/registry/config.yml:ro
+      - ${HARBOR_DATA_DIR}/secret/registry/passwd:/etc/registry/passwd:ro
+      - ${HARBOR_DATA_DIR}/secret/registry/root.crt:/etc/registry/root.crt:ro
+      - ./config/registryctl/config.yml:/etc/registryctl/config.yml:ro
+    depends_on:
+      - registry
+
+  core:
+    <<: *harbor-common
+    image: goharbor/harbor-core:${HARBOR_VERSION}
+    container_name: harbor-core
+    cap_drop: [ALL]
+    cap_add: [SETGID, SETUID]
+    environment:
+      <<: *core-urls
+      CONFIG_PATH: /etc/core/app.conf
+      UAA_CA_ROOT: /etc/core/certificates/uaa_ca.pem
+      PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL}
+      EXT_ENDPOINT: ${HARBOR_EXTERNAL_URL}
+      HARBOR_ADMIN_PASSWORD: ${HARBOR_ADMIN_PASSWORD:?ejecuta ./generate-env.sh}
+      # Base de datos
+      DATABASE_TYPE: postgresql
+      POSTGRESQL_HOST: postgresql
+      POSTGRESQL_PORT: "5432"
+      POSTGRESQL_USERNAME: postgres
+      POSTGRESQL_PASSWORD: ${DB_PASSWORD}
+      POSTGRESQL_DATABASE: registry
+      POSTGRESQL_SSLMODE: disable
+      POSTGRESQL_MAX_IDLE_CONNS: "100"
+      POSTGRESQL_MAX_OPEN_CONNS: "900"
+      POSTGRESQL_CONN_MAX_LIFETIME: 5m
+      POSTGRESQL_CONN_MAX_IDLE_TIME: "0"
+      # Redis
+      _REDIS_URL_CORE: redis://redis:6379?idle_timeout_seconds=30
+      _REDIS_URL_REG: redis://redis:6379/1?idle_timeout_seconds=30
+      # Servicios internos
+      CORE_LOCAL_URL: http://127.0.0.1:8080
+      PORTAL_URL: http://portal:8080
+      TOKEN_SERVICE_URL: http://core:8080/service/token
+      JOBSERVICE_URL: http://jobservice:8080
+      TRIVY_ADAPTER_URL: http://trivy-adapter:8080
+      WITH_TRIVY: "true"
+      MAX_JOB_WORKERS: "10"
+      REGISTRY_STORAGE_PROVIDER_NAME: filesystem
+      REGISTRY_CREDENTIAL_USERNAME: harbor_registry_user
+      REGISTRY_CREDENTIAL_PASSWORD: ${REGISTRY_PASSWORD}
+      # Secretos
+      CORE_SECRET: ${CORE_SECRET}
+      JOBSERVICE_SECRET: ${JOBSERVICE_SECRET}
+      CSRF_KEY: ${CSRF_KEY}
+      ROBOT_SCANNER_NAME_PREFIX: ${ROBOT_SCANNER_NAME_PREFIX}
+      READ_ONLY: "false"
+      RELOAD_KEY: ""
+      PERMITTED_REGISTRY_TYPES_FOR_PROXY_CACHE: docker-hub,harbor,azure-acr,ali-acr,aws-ecr,google-gcr,docker-registry,github-ghcr,jfrog-artifactory
+      REPLICATION_ADAPTER_WHITELIST: ali-acr,aws-ecr,azure-acr,docker-hub,docker-registry,github-ghcr,google-gcr,harbor,huawei-SWR,jfrog-artifactory,tencent-tcr,volcengine-cr
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
+    volumes:
+      - ${HARBOR_DATA_DIR}/ca_download/:/etc/core/ca/:z
+      - ${HARBOR_DATA_DIR}/:/data/:z
+      - ./config/core/app.conf:/etc/core/app.conf:ro
+      - ${HARBOR_DATA_DIR}/secret/core/private_key.pem:/etc/core/private_key.pem:ro
+      - ${HARBOR_DATA_DIR}/secret/keys/secretkey:/etc/core/key:ro
+    depends_on:
+      registry:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgresql:
+        condition: service_healthy
+
+  portal:
+    <<: *harbor-common
+    image: goharbor/harbor-portal:${HARBOR_VERSION}
+    container_name: harbor-portal
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, NET_BIND_SERVICE]
+    volumes:
+      - ./config/portal/nginx.conf:/etc/nginx/nginx.conf:ro
+
+  jobservice:
+    <<: *harbor-common
+    image: goharbor/harbor-jobservice:${HARBOR_VERSION}
+    container_name: harbor-jobservice
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID]
+    environment:
+      <<: *core-urls
+      CORE_SECRET: ${CORE_SECRET}
+      JOBSERVICE_SECRET: ${JOBSERVICE_SECRET}
+      JOBSERVICE_WEBHOOK_JOB_MAX_RETRY: "3"
+      JOBSERVICE_WEBHOOK_JOB_HTTP_CLIENT_TIMEOUT: "3"
+      LOG_LEVEL: ${LOG_LEVEL}
+      REGISTRY_CREDENTIAL_USERNAME: harbor_registry_user
+      REGISTRY_CREDENTIAL_PASSWORD: ${REGISTRY_PASSWORD}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
+    volumes:
+      - ${HARBOR_DATA_DIR}/job_logs:/var/log/jobs:z
+      - ./config/jobservice/config.yml:/etc/jobservice/config.yml:ro
+    # jobservice se cae si core aún no responde: esperar a que esté healthy
+    depends_on:
+      core:
+        condition: service_healthy
+
+  trivy-adapter:
+    <<: *harbor-common
+    image: goharbor/trivy-adapter-photon:${HARBOR_VERSION}
+    container_name: trivy-adapter
+    cap_drop: [ALL]
+    environment:
+      SCANNER_LOG_LEVEL: ${LOG_LEVEL}
+      SCANNER_REDIS_URL: redis://redis:6379/5?idle_timeout_seconds=30
+      SCANNER_STORE_REDIS_URL: redis://redis:6379/5?idle_timeout_seconds=30
+      SCANNER_STORE_REDIS_NAMESPACE: harbor.scanner.trivy:store
+      SCANNER_JOB_QUEUE_REDIS_URL: redis://redis:6379/5?idle_timeout_seconds=30
+      SCANNER_JOB_QUEUE_REDIS_NAMESPACE: harbor.scanner.trivy:job-queue
+      SCANNER_TRIVY_CACHE_DIR: /home/scanner/.cache/trivy
+      SCANNER_TRIVY_REPORTS_DIR: /home/scanner/.cache/reports
+      SCANNER_TRIVY_VULN_TYPE: os,library
+      SCANNER_TRIVY_SEVERITY: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+      SCANNER_TRIVY_IGNORE_UNFIXED: "false"
+      SCANNER_TRIVY_SKIP_UPDATE: "false"
+      SCANNER_TRIVY_SKIP_JAVA_DB_UPDATE: "false"
+      SCANNER_TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db
+      SCANNER_TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db
+      SCANNER_TRIVY_OFFLINE_SCAN: "false"
+      SCANNER_TRIVY_SECURITY_CHECKS: vuln
+      SCANNER_TRIVY_GITHUB_TOKEN: ${TRIVY_GITHUB_TOKEN:-}
+      SCANNER_TRIVY_INSECURE: "false"
+      SCANNER_TRIVY_TIMEOUT: 5m0s
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
+    volumes:
+      - ${HARBOR_DATA_DIR}/trivy-adapter/trivy:/home/scanner/.cache/trivy
+      - ${HARBOR_DATA_DIR}/trivy-adapter/reports:/home/scanner/.cache/reports
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Repositorio Debian (aptly). La API (subir paquetes, publicar) se expone en
+  # https://<host>/aptly/api/ con autenticación básica; los repositorios publicados
+  # se sirven en /debian/ directamente desde nginx.
+  # ---------------------------------------------------------------------------
+  aptly:
+    <<: *harbor-common
+    build: ./aptly
+    # Imagen construida en local (no existe en ningún registry): `docker compose pull`
+    # la omite y `up` la construye (con caché, apenas tarda)
+    image: generic_aptly
+    pull_policy: build
+    container_name: aptly
+    cap_drop: [ALL]
+    environment:
+      APTLY_GPG_NAME: ${APTLY_GPG_NAME:-Aptly Debian repository}
+      APTLY_GPG_EMAIL: ${APTLY_GPG_EMAIL:-debian@example.com}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
+    volumes:
+      - ${HARBOR_DATA_DIR}/aptly:/var/lib/aptly:z
+      - ./config/aptly/aptly.conf:/etc/aptly.conf:ro
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  proxy:
+    <<: *harbor-common
+    image: goharbor/nginx-photon:${HARBOR_VERSION}
+    container_name: nginx
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, NET_BIND_SERVICE]
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${HARBOR_DATA_DIR}/secret/cert:/etc/cert:ro
+      - ${HARBOR_DATA_DIR}/aptly/public:/aptly-public:ro
+      - ${HARBOR_DATA_DIR}/secret/aptly/api.htpasswd:/etc/nginx/aptly.htpasswd:ro
+    ports:
+      - ${HARBOR_HTTP_PORT}:8080
+      - ${HARBOR_HTTPS_PORT}:8443
+    depends_on:
+      core:
+        condition: service_healthy
+      portal:
+        condition: service_started
+      aptly:
+        condition: service_healthy
+
+networks:
+  harbor:
+    name: harbor

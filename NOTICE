@@ -1,0 +1,28 @@
+harbor_docker
+Copyright (c) 2026 Juan Maria Gomez Lopez <juan-maria.gomez-lopez@tutamail.com>
+
+This project is licensed under the MIT License (see LICENSE), except for the
+files listed below.
+
+Third-party material
+--------------------
+
+The following files are derived from the configuration templates shipped in the
+Harbor installer image goharbor/prepare:v2.15.2 (/usr/src/app/templates),
+Copyright Project Harbor Authors, licensed under the Apache License 2.0
+(see LICENSES/Apache-2.0.txt and https://github.com/goharbor/harbor).
+They have been modified by Juan Maria Gomez Lopez (pre-rendered values,
+environment variables instead of Jinja placeholders, Spanish comments, routes
+for the aptly Debian repository, health-based startup ordering) and remain
+under the Apache License 2.0:
+
+  docker-compose.yml
+  config/core/app.conf
+  config/jobservice/config.yml
+  config/nginx/nginx.conf
+  config/portal/nginx.conf
+  config/registry/config.yml
+  config/registryctl/config.yml
+
+Harbor is a Cloud Native Computing Foundation (CNCF) project. This project is
+not affiliated with or endorsed by the Harbor project.

@@ -1,0 +1,10 @@
+# Copyright Project Harbor Authors
+# Modifications Copyright (c) 2026 Juan Maria Gomez Lopez <juan-maria.gomez-lopez@tutamail.com>
+# SPDX-License-Identifier: Apache-2.0
+# Derivado de las plantillas de goharbor/prepare:v2.15.2 (ver NOTICE).
+
+---
+protocol: "http"
+port: 8080
+log_level: info
+registry_config: "/etc/registry/config.yml"
