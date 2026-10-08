@@ -8,11 +8,14 @@ D=/data
 HARBOR_UID=10000
 PG_UID=999
 REDIS_UID=999
+DTRACK_UID=1000      # dependencytrack/apiserver
+DTRACK_PG_UID=70     # postgres (Alpine)
 
 mkdir -p "$D/registry" "$D/database" "$D/redis" "$D/job_logs" "$D/ca_download" \
          "$D/trivy-adapter/trivy" "$D/trivy-adapter/reports" \
          "$D/secret/core" "$D/secret/registry" "$D/secret/keys" "$D/secret/cert" \
-         "$D/aptly/public" "$D/secret/aptly"
+         "$D/aptly/public" "$D/secret/aptly" \
+         "$D/dtrack/database" "$D/dtrack/apiserver"
 
 rand() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$1"; }
 
@@ -55,6 +58,8 @@ chown -R $HARBOR_UID:$HARBOR_UID "$D/registry" "$D/job_logs" "$D/ca_download" \
   "$D/aptly" "$D/secret/aptly"
 chown -R $PG_UID:$PG_UID "$D/database"
 chown -R $REDIS_UID:$REDIS_UID "$D/redis"
+chown -R $DTRACK_PG_UID:$DTRACK_PG_UID "$D/dtrack/database"
+chown -R $DTRACK_UID:$DTRACK_UID "$D/dtrack/apiserver"
 chmod 600 "$D/secret/core/private_key.pem" "$D/secret/keys/secretkey" "$D/secret/cert/server.key" \
   "$D/secret/aptly/api.htpasswd"
 

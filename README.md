@@ -6,7 +6,9 @@
 Despliegue autocontenido de [Harbor](https://goharbor.io), un registry privado de imágenes
 de contenedores (OCI) con UI web, control de acceso por proyectos, cuentas robot,
 escaneo de vulnerabilidades (Trivy), replicación y proxy-cache. Incluye además un
-**repositorio Debian** (aptly) para distribuir paquetes `.deb` propios con `apt`.
+**repositorio Debian** (aptly) para distribuir paquetes `.deb` propios con `apt` y
+**Dependency-Track** para analizar SBOM (CycloneDX) y vigilar las vulnerabilidades de las
+dependencias.
 
 A diferencia del instalador oficial, **no hace falta ejecutar `install.sh` ni `prepare`**:
 la configuración de cada componente ya está en `config/` (renderizada a partir de las
@@ -27,14 +29,15 @@ directorio de datos en cada arranque.
 8. [Acceso desde otras máquinas (túnel SSH)](#acceso-desde-otras-máquinas-túnel-ssh)
 9. [Uso básico](#uso-básico)
 10. [Repositorio Debian (aptly)](#repositorio-debian-aptly)
-11. [Operación del stack](#operación-del-stack)
-12. [Copias de seguridad y restauración](#copias-de-seguridad-y-restauración)
-13. [Actualizar Harbor](#actualizar-harbor)
-14. [Cambios de configuración habituales](#cambios-de-configuración-habituales)
-15. [Solución de problemas](#solución-de-problemas)
-16. [Seguridad](#seguridad)
-17. [Diferencias con el instalador oficial](#diferencias-con-el-instalador-oficial)
-18. [Licencia](#licencia)
+11. [Dependency-Track](#dependency-track)
+12. [Operación del stack](#operación-del-stack)
+13. [Copias de seguridad y restauración](#copias-de-seguridad-y-restauración)
+14. [Actualizar Harbor](#actualizar-harbor)
+15. [Cambios de configuración habituales](#cambios-de-configuración-habituales)
+16. [Solución de problemas](#solución-de-problemas)
+17. [Seguridad](#seguridad)
+18. [Diferencias con el instalador oficial](#diferencias-con-el-instalador-oficial)
+19. [Licencia](#licencia)
 
 ---
 
@@ -43,15 +46,16 @@ directorio de datos en cada arranque.
 | Recurso | Mínimo | Recomendado |
 |---|---|---|
 | CPU | 2 | 4 |
-| RAM | 4 GB | 8 GB |
-| Disco | 40 GB | 160 GB+ (depende del volumen de imágenes) |
+| RAM | 8 GB | 16 GB (Dependency-Track tiene un límite de 6 GB) |
+| Disco | 50 GB | 160 GB+ (depende del volumen de imágenes) |
 
 - Docker Engine **25 o superior** (se usa `healthcheck.start_interval`) y el plugin
   Docker Compose v2.
-- Puertos libres en el host: `80` y `443` (configurables).
+- Puertos libres en el host: `80` y `443`, y `8081`/`8082` para Dependency-Track (configurables).
 - Un nombre DNS (o IP) por el que los clientes accederán a Harbor.
 - Salida a internet hacia `ghcr.io` para que Trivy descargue su base de datos de
-  vulnerabilidades (ver [modo offline](#trivy-sin-acceso-a-internet)).
+  vulnerabilidades (ver [modo offline](#trivy-sin-acceso-a-internet)), y hacia las fuentes
+  de Dependency-Track (NVD, GitHub Advisories, OSV...).
 
 ## Puesta en marcha
 
@@ -116,9 +120,17 @@ de `.env`. Cámbiala desde la UI tras el primer acceso.
 | `trivy-adapter` | `goharbor/trivy-adapter-photon` | Escáner de vulnerabilidades |
 | `aptly` | `generic_aptly` (se construye desde `aptly/`) | Repositorio Debian: API para subir y publicar paquetes `.deb` firmados con GPG |
 | `proxy` | `goharbor/nginx-photon` | Punto de entrada HTTP/HTTPS. Sirve también `/debian/` (repositorio publicado) y `/aptly/api/` |
+| `dtrack-db` | `postgres:16.15-alpine` | Base de datos de Dependency-Track (`dtrack`), independiente de la de Harbor |
+| `dtrack-apiserver` | `dependencytrack/apiserver` | API de Dependency-Track: recibe SBOM, descarga las fuentes de vulnerabilidades y analiza |
+| `dtrack-frontend` | `dependencytrack/frontend` | UI web de Dependency-Track (la API la llama el navegador, no el contenedor) |
 
 Orden de arranque (controlado con `depends_on` + healthchecks):
-`init` → `postgresql`, `redis`, `aptly` → `registry` → `core` → `jobservice`, `proxy`.
+`init` → `postgresql`, `redis`, `aptly` → `registry` → `core` → `jobservice`, `proxy`;
+y en paralelo `init` → `dtrack-db` → `dtrack-apiserver` → `dtrack-frontend`.
+
+Dependency-Track va en su propia red (`dtrack`), sin acceso a los servicios de Harbor, y
+no pasa por el proxy: publica la API y la UI directamente en `127.0.0.1:8081` y
+`127.0.0.1:8082`.
 
 ## Estructura de ficheros
 
@@ -128,11 +140,13 @@ harbor_docker/
 ├── .env.example                # plantilla de variables
 ├── .env                        # (generado, NO versionar) variables y secretos
 ├── generate-env.sh             # crea .env con secretos aleatorios
+├── reset.sh                    # ⚠ borra todo el stack (contenedores, red, data/) para empezar de cero
 ├── scripts/init.sh             # lo ejecuta el servicio init en cada `up`
 ├── aptly/                      # imagen del repositorio Debian (Dockerfile + entrypoint.sh)
 ├── examples/
 │   ├── publish-deb.sh          # ejemplo: genera un .deb y lo publica en aptly
 │   ├── push-image.sh           # ejemplo: construye una imagen y la sube a Harbor
+│   ├── upload-sbom.sh          # ejemplo: genera el SBOM de una imagen y lo sube a Dependency-Track
 │   ├── compose_map.py          # genera un mapa HTML del compose con el estado de los contenedores
 │   └── compose-map.sh          # lanzador de compose_map.py: generar, abrir o servir por HTTP
 ├── config/
@@ -151,6 +165,9 @@ harbor_docker/
 │   ├── aptly/                  # BD, pool de paquetes y clave GPG de aptly (uid 10000)
 │   │   ├── gpg/                # ⚠ clave privada de firma del repositorio Debian
 │   │   └── public/             # repositorios publicados (servidos en /debian/)
+│   ├── dtrack/
+│   │   ├── database/           # PostgreSQL de Dependency-Track (uid 70)
+│   │   └── apiserver/          # claves, índices y réplica de NVD (uid 1000; varios GB)
 │   └── secret/
 │       ├── cert/server.{crt,key}       # certificado TLS del proxy
 │       ├── core/private_key.pem        # firma de tokens del registry
@@ -192,6 +209,10 @@ HARBOR_URL=https://localhost./examples/push-image.sh  ./examples/push-image.sh
 | `TRIVY_GITHUB_TOKEN` | Token de GitHub para evitar límites al descargar la BD de Trivy (opcional) |
 | `APTLY_API_USER` / `APTLY_API_PASSWORD` | Credenciales de la API de aptly (`/aptly/api/`). Se aplican en cada `up` |
 | `APTLY_GPG_NAME` / `APTLY_GPG_EMAIL` | Identidad de la clave GPG de firma (**solo al generarla**, en el primer arranque) |
+| `DTRACK_VERSION` | Tag de las imágenes `dependencytrack/*` (`4.14.5`) |
+| `DTRACK_DB_PASSWORD` | Contraseña de la BD de Dependency-Track (**fijada en el primer arranque**) |
+| `DTRACK_API_PORT` / `DTRACK_FRONTEND_PORT` | Puertos publicados de la API y la UI. Por defecto `127.0.0.1:8081` / `127.0.0.1:8082` |
+| `DTRACK_API_BASE_URL` | URL de la API **vista desde el navegador** (por defecto `http://localhost:8081`) |
 
 ## Certificado TLS
 
@@ -244,7 +265,8 @@ devuelve a `docker` para pedir el token, y con otra el `docker login` falla.
 ```bash
 # En cada cliente (sudo: los puertos locales < 1024 requieren root)
 sudo ssh -N -o ExitOnForwardFailure=yes \
-  -L 443:127.0.0.1:443 -L 80:127.0.0.1:80 usuario@servidor
+  -L 443:127.0.0.1:443 -L 80:127.0.0.1:80 \
+  -L 8081:127.0.0.1:8081 -L 8082:127.0.0.1:8082 usuario@servidor
 ```
 
 Con el túnel abierto, en el cliente:
@@ -255,6 +277,7 @@ Con el túnel abierto, en el cliente:
 | Docker | `docker login localhost` · `docker push localhost/<proyecto>/<imagen>:<tag>` |
 | apt | `deb [signed-by=/etc/apt/keyrings/aptly-repo.asc] http://localhost/debian trixie main` |
 | Scripts de ejemplo | `HARBOR_URL=https://localhost` / `APTLY_URL=https://localhost/aptly/api` |
+| Dependency-Track | UI `http://localhost:8082` (necesita también el túnel del 8081: el navegador llama a la API) |
 
 Notas:
 - Los puertos 80 y 443 del cliente tienen que estar libres. Para no usar `sudo`, se puede
@@ -263,13 +286,13 @@ Notas:
   `LocalForward 443 127.0.0.1:443`, `LocalForward 80 127.0.0.1:80` y `ExitOnForwardFailure yes`.
 - Para dar acceso a alguien solo al túnel, sin shell en el servidor, restringe su clave en
   `~/.ssh/authorized_keys`:
-  `restrict,port-forwarding,permitopen="127.0.0.1:443",permitopen="127.0.0.1:80" ssh-ed25519 AAAA...`
+  `restrict,port-forwarding,permitopen="127.0.0.1:443",permitopen="127.0.0.1:80",permitopen="127.0.0.1:8081",permitopen="127.0.0.1:8082" ssh-ed25519 AAAA...`
   y conecta con `ssh -N`.
 
 Comprobar en el servidor que solo escucha en localhost:
 
 ```bash
-ss -ltn | grep -E ':(80|443) '     # debe mostrar 127.0.0.1:80 y 127.0.0.1:443 (no 0.0.0.0)
+ss -ltn | grep -E ':(80|443|8081|8082) '   # todos en 127.0.0.1 (no 0.0.0.0)
 docker port nginx                  # 8080/tcp -> 127.0.0.1:80   8443/tcp -> 127.0.0.1:443
 curl -sk --max-time 3 https://<IP de la LAN>/ || echo "OK: no accesible por la red"
 ```
@@ -401,6 +424,74 @@ ningún registry). Tiene `pull_policy: build`: `docker compose pull` la omite y 
 construye si hace falta. Para actualizarla con los últimos parches de Debian o tras
 cambiar `aptly/`: `docker compose build --pull aptly && docker compose up -d aptly`.
 
+## Dependency-Track
+
+[Dependency-Track](https://dependencytrack.org) recibe SBOM (CycloneDX) de cada proyecto y
+avisa de las vulnerabilidades conocidas de sus dependencias. Es independiente de Harbor
+(BD, red y usuarios propios).
+
+- UI: `http://localhost:8082` (en el servidor o por el [túnel](#acceso-desde-otras-máquinas-túnel-ssh)).
+- API: `http://localhost:8081/api/v1/`.
+- Primer acceso: usuario `admin`, contraseña `admin`; obliga a cambiarla en el primer login.
+- Tras el primer arranque descarga las fuentes de vulnerabilidades (la réplica de NVD tarda
+  un rato y ocupa varios GB en `data/dtrack/apiserver`). Las primeras auditorías pueden
+  salir vacías hasta que termine.
+
+### Script de ejemplo: subir un SBOM
+
+[`examples/upload-sbom.sh`](examples/upload-sbom.sh) genera con Trivy el SBOM de una imagen
+(o usa un SBOM CycloneDX que ya tengas), lo sube a Dependency-Track creando el proyecto si
+no existe, espera a que se analice y muestra las vulnerabilidades por severidad. Si no hay
+`trivy` instalado, lo ejecuta en un contenedor (`aquasec/trivy:0.74.0`) que lee la imagen del
+Docker local.
+
+Para CI, crea un equipo en Administración → Access Management → Teams con los permisos
+`BOM_UPLOAD`, `PROJECT_CREATION_UPLOAD`, `VIEW_PORTFOLIO` y `VIEW_VULNERABILITY`, y genera
+una clave de API en él.
+
+```bash
+export DTRACK_API_KEY=odt_...             # o DTRACK_USER=admin DTRACK_PASSWORD=...
+./examples/upload-sbom.sh                                   # SBOM de ejemplo (log4j 2.14.1, ...)
+./examples/upload-sbom.sh localhost/demo/hola-harbor:1.0    # imagen de Harbor: proyecto demo/hola-harbor, versión 1.0
+./examples/upload-sbom.sh bom.json                          # SBOM existente
+FAIL_ON=HIGH ./examples/upload-sbom.sh localhost/demo/app:2.3   # código de salida 2 si hay HIGH o CRITICAL
+```
+
+```
+Dependency-Track 4.14.5 en http://localhost:8081
+SBOM: 3 componentes → proyecto ejemplo-sbom 1.0
+Procesando.
+Vulnerabilidades: 10 (high 4, medium 6)
+  HIGH       CVE-2026-28387         openssl 1.1.1k
+  HIGH       CVE-2026-28388         openssl 1.1.1k
+  ...
+  MEDIUM     CVE-2026-34477         log4j-core 2.14.1
+  ...
+Proyecto: http://localhost:8082/projects/21dd96e3-...
+```
+
+En una instalación nueva el resultado sale vacío hasta que termina la primera descarga de NVD.
+
+Con `curl` directamente:
+
+```bash
+# SBOM de una imagen de Harbor generado con Trivy (también vale syft, cdxgen...)
+trivy image --format cyclonedx -o bom.json localhost/<proyecto>/<imagen>:<tag>
+
+curl -s -X POST http://localhost:8081/api/v1/bom \
+  -H "X-Api-Key: $DTRACK_API_KEY" \
+  -F autoCreate=true -F projectName=<imagen> -F projectVersion=<tag> -F bom=@bom.json
+```
+
+Notas:
+- `DTRACK_API_BASE_URL` es la URL con la que el **navegador** llega a la API. Si cambias
+  `DTRACK_API_PORT` o abres el servicio a la red, actualízala.
+- Proxy de salida: Dependency-Track no usa `HTTP_PROXY`; configúralo con las variables
+  `ALPINE_HTTP_PROXY_ADDRESS`, `ALPINE_HTTP_PROXY_PORT` y `ALPINE_NO_PROXY` en `dtrack-apiserver`.
+- Actualizar: cambia `DTRACK_VERSION` en `.env` (lee antes las release notes; la 5.x cambia
+  la arquitectura y la configuración) y `docker compose up -d --wait`. El apiserver migra
+  el esquema de la BD al arrancar.
+
 ## Operación del stack
 
 **Mapa del stack**: [`examples/compose_map.py`](examples/compose_map.py) (Python 3, sin
@@ -458,6 +549,7 @@ docker compose start
 
 ```bash
 docker exec harbor-db pg_dump -U postgres registry | gzip > /backups/harbor-db-$(date +%F).sql.gz
+docker exec dtrack-db pg_dump -U dtrack dtrack | gzip > /backups/dtrack-db-$(date +%F).sql.gz
 ```
 
 **Restauración**:
@@ -469,7 +561,30 @@ sudo tar --numeric-owner -xzpf /backups/harbor-AAAA-MM-DD.tgz   # restaura data/
 docker compose up -d --wait
 ```
 
-`--numeric-owner` y `-p` conservan los UID 10000/999 que necesitan los contenedores.
+`--numeric-owner` y `-p` conservan los UID (10000, 999, 70, 1000) que necesitan los contenedores.
+
+### Empezar de cero
+
+[`reset.sh`](reset.sh) borra todo lo que crea el compose: contenedores, redes y el directorio
+de datos (imágenes, BD de Harbor, repositorio Debian y su clave GPG, Dependency-Track,
+secretos y certificado). Pide escribir `BORRAR` para confirmar.
+
+```bash
+./reset.sh --backup ~/harbor-$(date +%F).tgz     # copia previa de data/ y .env, y borra
+./reset.sh --env --up                            # secretos nuevos y arranca de nuevo
+./reset.sh --images --yes                        # también las imágenes; sin preguntar
+```
+
+- `--env` solo renueva los secretos (las variables vacías en `.env.example`): conserva
+  hostname, puertos y demás ajustes. Sin `--env`, un `.env` ya usado sirve igual para una
+  instalación nueva: `HARBOR_ADMIN_PASSWORD` y `DB_PASSWORD` se aplican en el primer arranque.
+- La copia se restaura con `sudo tar --numeric-owner -xzpf <copia>.tgz` en este directorio.
+- Después hay que repartir de nuevo el certificado TLS a los clientes Docker y la clave GPG
+  a los clientes apt; Dependency-Track vuelve a `admin`/`admin`.
+
+> **No borres `.env` a mano en una instalación en uso** (ni lo recrees con `generate-env.sh`):
+> la BD conserva la contraseña antigua y `core` no arranca (`password authentication failed`).
+> Ver [Cambiar la contraseña de la base de datos](#cambiar-la-contraseña-de-la-base-de-datos).
 
 ## Actualizar Harbor
 
@@ -559,13 +674,15 @@ En el servicio `trivy-adapter`, pon `SCANNER_TRIVY_SKIP_UPDATE: "true"` y
 | `x509: certificate signed by unknown authority` en `docker login/push` | El cliente no confía en el certificado: ver [Configurar los clientes Docker](#configurar-los-clientes-docker) |
 | `unauthorized: unauthorized to access repository` en push | El proyecto no existe o el usuario/robot no tiene permiso de push en él |
 | Push de capas grandes cortado / `413` | Revisa proxies intermedios; el nginx de Harbor tiene `client_max_body_size 0` |
-| `core` no llega a healthy | `docker compose logs core`: suele ser la contraseña de BD (`DB_PASSWORD` cambiada después del primer arranque) |
+| `core` no llega a healthy | `docker compose logs core`: suele ser la contraseña de BD (`DB_PASSWORD` cambiada después del primer arranque, p. ej. al regenerar `.env`): ver [cambiarla](#cambiar-la-contraseña-de-la-base-de-datos) |
 | `permission denied` en logs de registry/jobservice/trivy | Permisos de `data/` alterados (p. ej. tras copiar a mano): `docker compose up -d` vuelve a ejecutar `init`, que los corrige |
 | `bind: address already in use` | Los puertos 80/443 están ocupados: cambia `HARBOR_HTTP_PORT`/`HARBOR_HTTPS_PORT` |
 | La redirección HTTP lleva al puerto incorrecto | Ver [Puerto HTTPS distinto de 443](#puerto-https-distinto-de-443) |
 | Escaneos en `Error` | `docker compose logs trivy-adapter`: normalmente no puede descargar la BD desde `ghcr.io` (proxy, firewall o límite de peticiones → `TRIVY_GITHUB_TOKEN`) |
 | El disco no se libera tras borrar imágenes | Hace falta un **Garbage Collection** (Administración → Clean Up, o la API) |
 | `.env` falta o tiene secretos vacíos | `docker compose` falla con `ejecuta ./generate-env.sh` |
+| La UI de Dependency-Track carga pero no inicia sesión | El navegador no llega a `DTRACK_API_BASE_URL`: abre también el túnel del 8081 o corrige la URL |
+| `dtrack-apiserver` se reinicia (`OOMKilled`) | Sube el límite `memory` del servicio (6 GB) o libera RAM en el host |
 
 Diagnóstico rápido:
 
@@ -588,6 +705,8 @@ motor: `docker context show`.
 - Cambia la contraseña de `admin` y crea usuarios o integra LDAP/OIDC
   (Administración → Configuración → Autenticación).
 - Usa cuentas robot con permisos mínimos y caducidad para CI/CD.
+- Entra cuanto antes en Dependency-Track: hasta el primer login, `admin`/`admin` funciona
+  para cualquiera que llegue al puerto 8081.
 - Activa el escaneo automático en push y, si procede, impide el pull de imágenes con
   vulnerabilidades graves (configuración del proyecto).
 - La clave privada GPG de aptly (`data/aptly/gpg/`) no tiene passphrase: quien la

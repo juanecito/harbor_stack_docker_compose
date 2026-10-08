@@ -44,6 +44,13 @@ Para tareas de gestión de imágenes, contenedores o del propio Harbor, usa la s
    credenciales), subida + publicación firmada, `apt install` por HTTP y HTTPS, rechazo de
    firma con otra clave, y clave GPG conservada tras `down`/`up`.
 
+8. (2026-10-07) Se integró **Dependency-Track 4.14.5** (`dtrack-db`, `dtrack-apiserver`,
+   `dtrack-frontend`) a partir de un compose suelto (`docker-compose_additional_tmp.yml`):
+   versión fijada (`latest` apuntaba a 4.14.5; la 5.x cambia la configuración), datos en
+   `data/dtrack/`, red propia y puertos en `127.0.0.1:8081/8082`. Verificado en copia
+   temporal: 13 servicios healthy en ~33 s, 0 reinicios, login con cambio forzado de
+   contraseña, subida de SBOM, datos en PostgreSQL y persistencia tras `down`/`up`.
+
 ## Decisiones de diseño (y por qué)
 
 | Decisión | Motivo |
@@ -60,6 +67,8 @@ Para tareas de gestión de imágenes, contenedores o del propio Harbor, usa la s
 | `/debian/` servido por nginx desde `data/aptly/public` y también por HTTP | apt verifica las firmas GPG; evita repartir el certificado autofirmado |
 | Clave GPG generada por el entrypoint de aptly, sin passphrase | Firma desatendida por API (`"Signing":{"Batch":true}`) |
 | Puertos en `127.0.0.1:80/443` y URL `https://localhost` por defecto | Acceso solo por túnel SSH (`-L 443:127.0.0.1:443 -L 80:127.0.0.1:80`); la URL debe ser igual en servidor y clientes porque Harbor la usa como realm del token |
+| Dependency-Track con PostgreSQL propio (`postgres:16.15-alpine`) y red `dtrack` | Independiente de Harbor: actualizaciones y backups por separado, sin acceso a sus servicios |
+| Dependency-Track publicado en `127.0.0.1:8081/8082`, no tras nginx | El frontend llama a la API desde el navegador; se mantiene el acceso solo por túnel SSH |
 | `container_name` iguales al oficial (`harbor-core`, `harbor-db`, `redis`, `nginx`...; excepción: el registry se llama `registry_harbor`) | Compatibilidad con documentación y scripts de Harbor; `registry_harbor` por petición del equipo (2026-10-06) |
 
 ## Datos técnicos clave
@@ -79,6 +88,10 @@ Para tareas de gestión de imágenes, contenedores o del propio Harbor, usa la s
 - aptly: `rootDir` `/var/lib/aptly` = `data/aptly` (UID 10000), `gpgProvider: gpg2`,
   `GNUPGHOME=/var/lib/aptly/gpg`, API en `aptly:8080` (`aptly api serve -no-lock`).
   Rutas públicas: `/debian/` (repo) y `/aptly/api/` (API con auth).
+- Dependency-Track: apiserver UID **1000** (`data/dtrack/apiserver`, límite 6 GB de RAM), postgres
+  Alpine UID **70** (`data/dtrack/database`, BD/usuario `dtrack`). Las imágenes de postgres y del
+  frontend no traen `HEALTHCHECK`: su `test` se define en el compose con el ancla `*healthcheck-timing`.
+  `DTRACK_API_BASE_URL` es la URL de la API vista desde el navegador.
 - Requiere Docker Engine ≥ 25 (`start_interval`). Probado con Docker 27.1.1 y Compose v5.5.1.
 
 ## Convenciones al modificar este proyecto
@@ -108,6 +121,7 @@ Para tareas de gestión de imágenes, contenedores o del propio Harbor, usa la s
 ./generate-env.sh                          # crear .env (una vez)
 docker compose config -q                   # validar
 docker compose up -d --wait                # arrancar
+./reset.sh [--backup f.tgz] [--env] [--up] # ⚠ borrar todo y empezar de cero (pide confirmación)
 docker compose ps                          # estado
 docker compose logs -f core                # logs
 curl -sk https://<host>/api/v2.0/health    # salud por componente

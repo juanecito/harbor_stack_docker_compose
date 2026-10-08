@@ -20,6 +20,7 @@ sed -e "s|^HARBOR_ADMIN_PASSWORD=.*|HARBOR_ADMIN_PASSWORD=$(rand 20)|" \
     -e "s|^CSRF_KEY=.*|CSRF_KEY=$(rand 32)|" \
     -e "s|^ROBOT_SCANNER_NAME_PREFIX=.*|ROBOT_SCANNER_NAME_PREFIX=$(rand 8)|" \
     -e "s|^APTLY_API_PASSWORD=.*|APTLY_API_PASSWORD=$(rand 24)|" \
+    -e "s|^DTRACK_DB_PASSWORD=.*|DTRACK_DB_PASSWORD=$(rand 24)|" \
     .env.example > .env
 chmod 600 .env
 

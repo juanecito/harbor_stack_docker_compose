@@ -4,6 +4,9 @@
 # Secretos y datos persistentes: no versionar
 .env
 data/
+# Temporales de reset.sh --env (contienen secretos)
+.env.old.*
+.env.merged
 
 # Mapa generado por examples/compose-map.sh
 compose-map.html

@@ -13,7 +13,8 @@
 #   docker compose up -d
 #
 # Componentes: init (one-shot), postgresql, redis (valkey), registry, registryctl,
-# core, portal, jobservice, trivy-adapter, aptly (repositorio Debian) y proxy (nginx, TLS).
+# core, portal, jobservice, trivy-adapter, aptly (repositorio Debian), proxy (nginx, TLS)
+# y Dependency-Track (dtrack-db, dtrack-apiserver, dtrack-frontend; red propia).
 
 name: harbor
 
@@ -23,7 +24,7 @@ x-harbor-common: &harbor-common
     - harbor
   # Mantiene el test de healthcheck de cada imagen; solo acelera la detección
   # durante el arranque (start_interval requiere Docker Engine >= 25)
-  healthcheck:
+  healthcheck: &healthcheck-timing
     interval: 30s
     start_period: 120s
     start_interval: 3s
@@ -303,6 +304,80 @@ services:
       aptly:
         condition: service_healthy
 
+  # ---------------------------------------------------------------------------
+  # Dependency-Track (análisis de SBOM y vulnerabilidades de dependencias).
+  # Independiente de Harbor: red y PostgreSQL propios. Se publica directamente en
+  # 127.0.0.1 (API en DTRACK_API_PORT, UI en DTRACK_FRONTEND_PORT), sin pasar por nginx.
+  # ---------------------------------------------------------------------------
+  dtrack-db:
+    <<: *harbor-common
+    image: postgres:16.15-alpine
+    container_name: dtrack-db
+    networks:
+      - dtrack
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    environment:
+      POSTGRES_DB: dtrack
+      POSTGRES_USER: dtrack
+      POSTGRES_PASSWORD: ${DTRACK_DB_PASSWORD:?añade DTRACK_DB_PASSWORD a .env}
+    volumes:
+      - ${HARBOR_DATA_DIR}/dtrack/database:/var/lib/postgresql/data:z
+    # La imagen de postgres no trae HEALTHCHECK
+    healthcheck:
+      <<: *healthcheck-timing
+      test: ["CMD-SHELL", "pg_isready -U dtrack -d dtrack"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+
+  dtrack-apiserver:
+    <<: *harbor-common
+    image: dependencytrack/apiserver:${DTRACK_VERSION}
+    container_name: dtrack-apiserver
+    networks:
+      - dtrack
+    cap_drop: [ALL]
+    environment:
+      ALPINE_DATABASE_MODE: external
+      ALPINE_DATABASE_URL: jdbc:postgresql://dtrack-db:5432/dtrack
+      ALPINE_DATABASE_DRIVER: org.postgresql.Driver
+      ALPINE_DATABASE_USERNAME: dtrack
+      ALPINE_DATABASE_PASSWORD: ${DTRACK_DB_PASSWORD}
+    # Java usa el 80 % de este límite como heap (MaxRAMPercentage de la imagen)
+    deploy:
+      resources:
+        limits:
+          memory: 6g
+    volumes:
+      - ${HARBOR_DATA_DIR}/dtrack/apiserver:/data:z
+    ports:
+      - ${DTRACK_API_PORT:-127.0.0.1:8081}:8080
+    depends_on:
+      dtrack-db:
+        condition: service_healthy
+
+  dtrack-frontend:
+    <<: *harbor-common
+    image: dependencytrack/frontend:${DTRACK_VERSION}
+    container_name: dtrack-frontend
+    networks:
+      - dtrack
+    cap_drop: [ALL]
+    environment:
+      # URL de la API vista desde el navegador (no desde el contenedor)
+      API_BASE_URL: ${DTRACK_API_BASE_URL:-http://localhost:8081}
+    # La imagen del frontend no trae HEALTHCHECK
+    healthcheck:
+      <<: *healthcheck-timing
+      test: ["CMD", "curl", "-fs", "--noproxy", "*", "-o", "/dev/null", "http://127.0.0.1:8080/"]
+    ports:
+      - ${DTRACK_FRONTEND_PORT:-127.0.0.1:8082}:8080
+    depends_on:
+      - dtrack-apiserver
+
 networks:
   harbor:
     name: harbor
+  dtrack:
+    name: dtrack

@@ -1,6 +1,6 @@
 ---
 name: harbor-docker
-description: Gestionar imágenes y contenedores Docker y el registry Harbor desplegado en harbor_docker. Cubre el ciclo de vida del stack (arrancar, parar, logs, salud, actualizar, backup), las imágenes (build, tag, push, pull, multi-arquitectura, copiar entre registries, limpieza local) la administración de Harbor por API (proyectos, robots, usuarios, artefactos, escaneos, garbage collection) y el repositorio Debian integrado (aptly: subir y publicar paquetes .deb, configurar clientes apt). Úsala cuando el usuario pida subir, bajar, listar, borrar o escanear imágenes, crear proyectos o cuentas robot, publicar paquetes Debian, revisar o reiniciar contenedores, liberar espacio o diagnosticar Harbor.
+description: Gestionar imágenes y contenedores Docker y el registry Harbor desplegado en harbor_docker. Cubre el ciclo de vida del stack (arrancar, parar, logs, salud, actualizar, backup), las imágenes (build, tag, push, pull, multi-arquitectura, copiar entre registries, limpieza local) la administración de Harbor por API (proyectos, robots, usuarios, artefactos, escaneos, garbage collection) el repositorio Debian integrado (aptly: subir y publicar paquetes .deb, configurar clientes apt) y Dependency-Track (subir SBOM, consultar vulnerabilidades). Úsala cuando el usuario pida subir, bajar, listar, borrar o escanear imágenes, crear proyectos o cuentas robot, publicar paquetes Debian, subir SBOM, revisar o reiniciar contenedores, liberar espacio o diagnosticar Harbor.
 ---
 
 <!-- Copyright (c) 2026 Juan Maria Gomez Lopez <juan-maria.gomez-lopez@tutamail.com>
@@ -77,6 +77,7 @@ Qué mirar según el síntoma:
 | Jobs (replicación, GC, retención) atascados | `jobservice`, `redis` |
 | Escaneos en Error | `trivy-adapter` (descarga de la BD desde ghcr.io) |
 | `core` unhealthy | `core` + `postgresql` (contraseña de BD), `redis` |
+| Dependency-Track no inicia sesión / no arranca | `dtrack-apiserver` (BD, `OOMKilled`), `dtrack-db`; la UI necesita llegar a `DTRACK_API_BASE_URL` |
 | `permission denied` | `docker compose up -d` (init corrige los permisos de `data/`) |
 
 Después de editar ficheros de `config/`, reinicia el servicio afectado:
@@ -292,11 +293,34 @@ docker compose exec aptly aptly publish list                                  # 
 - Nunca borres ni regeneres `data/aptly/gpg/`: los clientes dejarían de aceptar el repositorio.
 - Tras cambiar `aptly/`: `docker compose build aptly && docker compose up -d aptly`.
 
+## 4c. Dependency-Track
+
+Servicios `dtrack-db`, `dtrack-apiserver` (API en `http://localhost:8081`) y `dtrack-frontend`
+(UI en `http://localhost:8082`), en su propia red `dtrack`. Primer login `admin`/`admin`
+(obliga a cambiarla). Detalle: sección "Dependency-Track" del README.
+
+```bash
+D=http://localhost:8081
+curl -s $D/api/version                                                          # ✅
+T=$(curl -s -X POST $D/api/v1/user/login -d "username=admin&password=$DT_PASS")  # ✅ JWT (o usa -H "X-Api-Key: ...")
+curl -s -X POST $D/api/v1/bom -H "Authorization: Bearer $T" \
+  -F autoCreate=true -F projectName=app -F projectVersion=1.0 -F bom=@bom.json  # ✅ subir SBOM CycloneDX
+curl -s "$D/api/v1/project?name=app" -H "Authorization: Bearer $T"              # ✅ buscar proyecto
+curl -s "$D/api/v1/vulnerability/project/<uuid>" -H "Authorization: Bearer $T"  # vulnerabilidades del proyecto
+docker exec dtrack-db psql -U dtrack -d dtrack -tAc 'select "NAME","VERSION" from "PROJECT"'   # ✅
+```
+
+- SBOM de una imagen de Harbor: `trivy image --format cyclonedx -o bom.json localhost/<p>/<img>:<tag>`.
+- Script listo para usar: `examples/upload-sbom.sh [imagen|bom.json]` (genera el SBOM con Trivy, sube,
+  espera el análisis y lista hallazgos; `FAIL_ON=HIGH` para CI; `DTRACK_API_KEY` o `DTRACK_USER`/`DTRACK_PASSWORD`). ✅
+- `data/dtrack/apiserver` guarda las claves con las que DT cifra secretos: no lo borres.
+
 ## 5. Base de datos, backups y actualización
 
 ```bash
 docker exec harbor-db psql -U postgres -d registry -tAc "select name from project"      # ✅
 docker exec harbor-db pg_dump -U postgres registry | gzip > harbor-db-$(date +%F).sql.gz # ✅ backup en caliente de la BD
+docker exec dtrack-db pg_dump -U dtrack dtrack | gzip > dtrack-db-$(date +%F).sql.gz      # backup de Dependency-Track
 ```
 
 - **Backup completo** ⚠ (parada breve): `docker compose stop && sudo tar --numeric-owner -czpf
